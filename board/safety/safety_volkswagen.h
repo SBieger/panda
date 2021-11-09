@@ -53,6 +53,28 @@ AddrCheckStruct volkswagen_pq_addr_checks[] = {
 #define VOLKSWAGEN_PQ_ADDR_CHECKS_LEN (sizeof(volkswagen_pq_addr_checks) / sizeof(volkswagen_pq_addr_checks[0]))
 addr_checks volkswagen_pq_rx_checks = {volkswagen_pq_addr_checks, VOLKSWAGEN_PQ_ADDR_CHECKS_LEN};
 
+// Safety-relevant CAN messages for the Audi B8 platform
+#define MSG_ESP_03      0x103   // RX from ABS, for wheel speeds
+#define MSG_LH_EPS_03   0x09F   // RX from EPS, for driver steering torque
+#define MSG_ESP_05      0x106   // RX from ABS, for brake switch state
+#define MSG_TSK_02      0x10C   // RX from ECU, for ACC status from drivetrain coordinator
+#define MSG_MOTOR_03    0x105   // RX from ECU, for driver throttle input
+#define MSG_HCA_01      0x126   // TX by OP, Heading Control Assist steering torque
+#define MSG_LS_01       0x10B   // TX by OP, ACC control buttons for cancel/resume
+
+const CanMsg AUDI_B8_TX_MSGS[] = {{MSG_HCA_01, 0, 8}, {MSG_LS_01, 2, 8}};
+#define AUDI_B8_TX_MSGS_LEN (sizeof(AUDI_B8_TX_MSGS) / sizeof(AUDI_B8_TX_MSGS[0]))
+
+AddrCheckStruct audi_b8_addr_checks[] = {
+  {.msg = {{MSG_ESP_03, 0, 8, .check_checksum = true, .max_counter = 15U,  .expected_timestep = 20000U}, { 0 }, { 0 }}},
+  {.msg = {{MSG_LH_EPS_03, 0, 8, .check_checksum = true,  .max_counter = 15U, .expected_timestep = 10000U}, { 0 }, { 0 }}},
+  {.msg = {{MSG_ESP_05, 0, 8, .check_checksum = true,  .max_counter = 15U, .expected_timestep = 20000U}, { 0 }, { 0 }}},
+  {.msg = {{MSG_TSK_02, 0, 8, .check_checksum = true,  .max_counter = 15U, .expected_timestep = 20000U}, { 0 }, { 0 }}},
+  {.msg = {{MSG_MOTOR_03, 0, 8, .check_checksum = true,  .max_counter = 15U, .expected_timestep = 10000U}, { 0 }, { 0 }}},
+};
+#define AUDI_B8_ADDR_CHECKS_LEN (sizeof(audi_b8_addr_checks) / sizeof(audi_b8_addr_checks[0]))
+addr_checks audi_b8_rx_checks = {audi_b8_addr_checks, AUDI_B8_ADDR_CHECKS_LEN};
+
 int volkswagen_torque_msg = 0;
 int volkswagen_lane_msg = 0;
 uint8_t volkswagen_crc8_lut_8h2f[256]; // Static lookup table for CRC8 poly 0x2F, aka 8H2F/AUTOSAR
@@ -119,6 +141,37 @@ static uint8_t volkswagen_pq_compute_checksum(CAN_FIFOMailBox_TypeDef *to_push) 
   return checksum;
 }
 
+static uint8_t audi_b8_compute_crc(CAN_FIFOMailBox_TypeDef *to_push) {
+  int addr = GET_ADDR(to_push);
+  int len = GET_LEN(to_push);
+  uint8_t crc;
+  uint8_t counter;
+
+  switch(addr) {
+    case MSG_LH_EPS_03:
+      counter = volkswagen_mqb_get_counter(to_push);
+      crc = 0xFFU;
+      for (int i = 1; i < len; i++) {
+        crc ^= (uint8_t)GET_BYTE(to_push, i);
+        crc = volkswagen_crc8_lut_8h2f[crc];
+      }
+      crc ^= (uint8_t[]){0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5,0xF5}[counter];
+      crc = volkswagen_crc8_lut_8h2f[crc];
+      crc ^= 0xFFU;
+      break;
+    default: // MSG_ESP_03, MSG_ESP_05, MSG_TSK_02, MSG_MOTOR_03 and most likely others
+      crc = 0x00U;
+      for (int i = 1; i < len; i++) {
+        crc ^= (uint8_t)GET_BYTE(to_push, i);
+      }
+      crc ^= (addr >> 8) & 0xFF;
+      crc ^= addr & 0xFF;
+      break;
+  }
+
+  return crc;
+}
+
 static const addr_checks* volkswagen_mqb_init(int16_t param) {
   UNUSED(param);
 
@@ -138,6 +191,17 @@ static const addr_checks* volkswagen_pq_init(int16_t param) {
   volkswagen_torque_msg = MSG_HCA_1;
   volkswagen_lane_msg = MSG_LDW_1;
   return &volkswagen_pq_rx_checks;
+}
+
+static const addr_checks* audi_b8_init(int16_t param) {
+  UNUSED(param);
+
+  controls_allowed = false;
+  relay_malfunction_reset();
+  volkswagen_torque_msg = MSG_HCA_01;
+  volkswagen_lane_msg = 0; // LDW message not used at the moment
+  gen_crc_lookup_table(0x2F, volkswagen_crc8_lut_8h2f);
+  return &audi_b8_rx_checks;
 }
 
 static int volkswagen_mqb_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
@@ -257,6 +321,66 @@ static int volkswagen_pq_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
   return valid;
 }
 
+static int audi_b8_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
+
+  bool valid = addr_safety_check(to_push, &audi_b8_rx_checks,
+                                 volkswagen_get_checksum, audi_b8_compute_crc, volkswagen_mqb_get_counter);
+
+  if (valid && (GET_BUS(to_push) == 0)) {
+    int addr = GET_ADDR(to_push);
+
+    // Update in-motion state by sampling front wheel speeds
+    // Signal: ESP_03.ESP_VL_Radgeschw (front left) in scaled km/h
+    // Signal: ESP_03.ESP_VR_Radgeschw (front right) in scaled km/h
+    if (addr == MSG_ESP_03) {
+      int wheel_speed_fl = (GET_BYTE(to_push, 2) | (GET_BYTE(to_push, 3) << 8)) & 0xFFF;
+      int wheel_speed_fr = ((GET_BYTE(to_push, 3) >> 4) | (GET_BYTE(to_push, 4) << 4)) & 0xFFF;
+      // Check for average front speed in excess of 0.3m/s, 1.08km/h
+      // DBC speed scale 0.1: 0.3m/s = about 11, sum both wheels to compare
+      vehicle_moving = (wheel_speed_fl + wheel_speed_fr) > 22;
+    }
+
+    // Update driver input torque samples
+    // Signal: LH_EPS_03.EPS_Lenkmoment (absolute torque)
+    // Signal: LH_EPS_03.EPS_VZ_Lenkmoment (direction)
+    if (addr == MSG_LH_EPS_03) {
+      int torque_driver_new = GET_BYTE(to_push, 5) | ((GET_BYTE(to_push, 6) & 0x1F) << 8);
+      int sign = (GET_BYTE(to_push, 6) & 0x80) >> 7;
+      if (sign == 1) {
+        torque_driver_new *= -1;
+      }
+      update_sample(&torque_driver, torque_driver_new);
+    }
+
+    // Enter controls on rising edge of stock ACC, exit controls if stock ACC disengages
+    // Signal: TSK_02.TSK_Status_GRA_ACC_01
+    if (addr == MSG_TSK_02) {
+      int acc_status = (GET_BYTE(to_push, 2) & 0x3);
+      int cruise_engaged = (acc_status == 1) ? 1 : 0;
+      if (cruise_engaged && !cruise_engaged_prev) {
+        controls_allowed = 1;
+      }
+      if (!cruise_engaged) {
+        controls_allowed = 0;
+      }
+      cruise_engaged_prev = cruise_engaged;
+    }
+
+    // Signal: Motor_03.MO_Fahrpedalrohwert_01
+    if (addr == MSG_MOTOR_03) {
+      gas_pressed = GET_BYTE(to_push, 6) != 0;
+    }
+
+    // Signal: ESP_05.ESP_Fahrer_bremst
+    if (addr == MSG_ESP_05) {
+      brake_pressed = (GET_BYTE(to_push, 3) >> 2) & 0x01;
+    }
+
+    generic_rx_checks((addr == MSG_HCA_01));
+  }
+  return valid;
+}
+
 static bool volkswagen_steering_check(int desired_torque) {
   bool violation = false;
   uint32_t ts = microsecond_timer_get();
@@ -370,6 +494,42 @@ static int volkswagen_pq_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
   return tx;
 }
 
+static int audi_b8_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
+  int addr = GET_ADDR(to_send);
+  int tx = 1;
+
+  if (!msg_allowed(to_send, AUDI_B8_TX_MSGS, AUDI_B8_TX_MSGS_LEN)) {
+    tx = 0;
+  }
+
+  // Safety check for HCA_01 Heading Control Assist torque
+  // Signal: HCA_01.Assist_Torque (absolute torque)
+  // Signal: HCA_01.Assist_VZ (direction)
+  if (addr == MSG_HCA_01) {
+    int desired_torque = GET_BYTE(to_send, 2) | ((GET_BYTE(to_send, 3) & 0x3F) << 8);
+    int sign = (GET_BYTE(to_send, 3) & 0x80) >> 7;
+    if (sign == 1) {
+      desired_torque *= -1;
+    }
+
+    if (volkswagen_steering_check(desired_torque)) {
+      tx = 0;
+    }
+  }
+
+  // FORCE CANCEL: ensuring that only the cancel button press is sent when controls are off.
+  // This avoids unintended engagements while still allowing resume spam
+  if ((addr == MSG_LS_01) && !controls_allowed) {
+    // disallow resume and set: bits 16 and 19
+    if ((GET_BYTE(to_send, 2) & 0x9) != 0) {
+      tx = 0;
+    }
+  }
+
+  // 1 allows the message through
+  return tx;
+}
+
 static int volkswagen_fwd_hook(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   int addr = GET_ADDR(to_fwd);
   int bus_fwd = -1;
@@ -411,6 +571,15 @@ const safety_hooks volkswagen_pq_hooks = {
   .init = volkswagen_pq_init,
   .rx = volkswagen_pq_rx_hook,
   .tx = volkswagen_pq_tx_hook,
+  .tx_lin = nooutput_tx_lin_hook,
+  .fwd = volkswagen_fwd_hook,
+};
+
+// Audi B8 platform
+const safety_hooks audi_b8_hooks = {
+  .init = audi_b8_init,
+  .rx = audi_b8_rx_hook,
+  .tx = audi_b8_tx_hook,
   .tx_lin = nooutput_tx_lin_hook,
   .fwd = volkswagen_fwd_hook,
 };

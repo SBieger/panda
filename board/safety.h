@@ -39,6 +39,7 @@
 #define SAFETY_SUBARU_LEGACY 22U
 #define SAFETY_HYUNDAI_LEGACY 23U
 #define SAFETY_HYUNDAI_COMMUNITY 24U
+#define SAFETY_AUDI_B8 26U
 
 uint16_t current_safety_mode = SAFETY_SILENT;
 int16_t current_safety_param = 0;
@@ -247,6 +248,7 @@ const safety_hook_config safety_hook_registry[] = {
   {SAFETY_CHRYSLER, &chrysler_hooks},
   {SAFETY_SUBARU, &subaru_hooks},
   {SAFETY_VOLKSWAGEN_MQB, &volkswagen_mqb_hooks},
+  {SAFETY_AUDI_B8, &audi_b8_hooks},
   {SAFETY_NISSAN, &nissan_hooks},
   {SAFETY_NOOUTPUT, &nooutput_hooks},
   {SAFETY_HYUNDAI_LEGACY, &hyundai_legacy_hooks},
