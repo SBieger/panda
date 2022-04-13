@@ -187,9 +187,8 @@ int get_health_pkt(void *dat) {
 }
 
 int get_rtc_pkt(void *dat) {
-  timestamp_t t = rtc_get_time();
-  (void)memcpy(dat, &t, sizeof(t));
-  return sizeof(t);
+  (void)memcpy(dat, &audi_time, sizeof(audi_time));
+  return sizeof(audi_time);
 }
 
 int usb_cb_ep1_in(void *usbdata, int len, bool hardwired) {

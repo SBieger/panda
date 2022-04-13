@@ -1,10 +1,23 @@
+timestamp_t audi_time = {0};
+
 const addr_checks default_rx_checks = {
   .check = NULL,
   .len = 0,
 };
 
 int default_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
-  UNUSED(to_push);
+  int addr = GET_ADDR(to_push);
+
+  if (addr == 0x6B2)
+  {
+    audi_time.year = (((GET_BYTE(to_push, 4) << 4) | (GET_BYTE(to_push, 3) >> 4)) & 0x7F) + 2000;
+    audi_time.month = (GET_BYTE(to_push, 4) >> 3) & 0x0F;
+    audi_time.day = ((GET_BYTE(to_push, 5) << 1) | (GET_BYTE(to_push, 4) >> 7)) & 0x1F;
+    audi_time.hour = ((GET_BYTE(to_push, 6) << 4) | (GET_BYTE(to_push, 5) >> 4)) & 0x1F;
+    audi_time.minute = (GET_BYTE(to_push, 6) >> 1) & 0x3F;
+    audi_time.second = ((GET_BYTE(to_push, 7) << 1) | (GET_BYTE(to_push, 6) >> 7)) & 0x3F;
+  }
+
   return true;
 }
 
